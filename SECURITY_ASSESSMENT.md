@@ -34,7 +34,7 @@ Vendor gateway: https://halliday-gateway.halliday-tech.com
   /hallidayiot/app/device/update/info
 ```
 
-The application checks for an update at the vendor gateway, starts and records OTA state through the listed APIs, then orchestrates the glasses over BLE. HCI evidence confirmed a real OTA transaction: wearable AP mode, HTTP service availability, FTP credentials supplied in cleartext BLE traffic, a target OTA archive name, and a successful transfer status. The firmware payload itself was not recovered from the Android app sandbox during this run.
+The application checks for an update at the vendor gateway, starts and records OTA state through the listed APIs, then orchestrates the glasses over BLE. HCI evidence confirmed a real OTA transaction: wearable AP mode, HTTP service availability, FTP credentials supplied in cleartext BLE traffic, a target OTA archive name, and a successful transfer status. The production firmware was subsequently acquired through the authenticated vendor update flow and analysed offline.
 
 ## Consolidated findings
 
@@ -42,11 +42,19 @@ The application checks for an update at the vendor gateway, starts and records O
 |---|---|---|---|
 | F-01 | Critical | OTA firmware trust chain is broken | A retrieved production package uses the public AOSP test certificate; the observed update script did not cryptographically authenticate component images before flashing. |
 | F-02 | Critical | Initial device claim is unauthenticated | A newly unbonded device accepted a fabricated identity claim and then accepted privileged OTA commands. |
-| F-03 | High | OTA AP with HTTP/FTP update surface and weak disclosed credentials | Nearby attackers can attempt unauthorised access to the wearable update network and services. |
+| F-03 | High | OTA AP with HTTP/FTP update surface and low-entropy initial passwords | Nearby attackers can recover the credentials from BLE traffic or cheaply guess them, then access the wearable update network and services. |
 | F-04 | High | Microphone/audio path is exposed after weak bond | Audio uses the same proprietary BLE command/notification channel; a recovered Start Meeting command requires no demonstrated session secret. End-to-end capture remains to be repeated under controlled lab conditions. |
 | F-05 | Medium | GATT connected callback does not require successful status | Initial connection may be reported as ready after a failed or incomplete GATT setup. |
 | F-06 | Medium | Auto-connect path can return without closing the GATT client | Repeated connection attempts may leak client resources and degrade reconnect reliability. |
 | F-07 | Low | CCCD ordering race | The app writes the descriptor before enabling local notifications; a first indication can be lost on fast peripherals. |
+
+### F-03 password strength and disclosure detail
+
+The live OTA trace exposed two initial service passwords: an eight-character Wi-Fi AP password and a six-character FTP password. Both used simple lowercase-letter/digit constructions; the literal values are withheld from this repository. Even if each character had been independently and uniformly selected from all 36 lowercase alphanumeric symbols—which the observed human-readable patterns do not support—the nominal search-space ceilings would be only about 41.4 bits and 31.0 bits respectively. Their effective entropy is materially lower because they follow predictable textual patterns and appear to be product defaults rather than device-generated random secrets.
+
+The FTP password is below a reasonable modern minimum and is feasible to guess online if rate limiting is absent. The eight-character AP password merely meets the minimum WPA passphrase length and is unsuitable for protecting a security-sensitive update service. More importantly, brute force is unnecessary in the observed workflow: both credentials are transmitted to the phone in readable BLE application payloads after the weak initial bond. Anyone able to complete that bond can obtain the passwords directly. If the same values are reused across devices or update sessions, compromise of one trace becomes a fleet-level or persistent credential exposure.
+
+These are not independent authentication factors: the party that reaches the weak BLE trust boundary is given the credentials for the next Wi-Fi/FTP boundary. Password rotation alone is therefore insufficient. The local update service needs device-bound, high-entropy, single-use credentials delivered only after authenticated account and device proof, with a short expiry, connection throttling, and no plaintext FTP.
 
 ## Initial-connection analysis
 

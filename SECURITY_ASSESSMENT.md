@@ -1,94 +1,113 @@
-# Halliday G2 Android companion app and wearable update-path assessment
+# Halliday G2 security assessment — final conclusions
 
-## Scope and evidence
+## Scope
 
-Assessment target: Android package `com.halliday.oasis` (version `0.1.3`, build `134`). The review combined JADX recovery, native Flutter/AOT string and call-path review, on-device installation, and a Bluetooth HCI trace of a user-authorised OTA update. The assessed APK SHA-256 is `824f64ea5b5244b12ef779a62ee7ad098fe778177bb3f9437b0545f44e6f9338`.
+This document consolidates the final conclusions from an authorised static and dynamic assessment of the Halliday G2 Android companion app and wearable firmware.
 
-Sensitive trace fields, device identifiers, credentials, and the firmware payload are deliberately redacted from this published document.
+| Item | Assessed value |
+|---|---|
+| Android package | `com.halliday.oasis` |
+| App version | `0.1.3` (build 134) |
+| APK SHA-256 | `824f64ea5b5244b12ef779a62ee7ad098fe778177bb3f9437b0545f44e6f9338` |
+| Wearable firmware | Upgrade from 0.16.x to 0.18.1 observed; 0.18.1 package acquired and analysed |
+| Methods | APK/JADX and Dart-AOT analysis, authenticated API tracing, HCI analysis, live BLE tests, OTA extraction, package/script review, and partial Ghidra analysis of the AP and Bluetooth firmware images |
 
-## Executive conclusion
+Raw captures, account tokens, device serial numbers, and other PII-bearing evidence are retained outside this repository. This private report includes service credentials because they are necessary to describe the verified historical exposure accurately.
 
-The initial BLE connection and OTA process have material security weaknesses. The critical risk is a practical trust-chain failure: a production OTA package was retrieved through the real update flow, is signed with the publicly available AOSP test certificate, and its on-device flashing script did not perform cryptographic image verification before writing component images. The wearable also exposes an OTA Wi-Fi access-point mode with HTTP and FTP services and discloses weak credentials over BLE. Together, these conditions create a plausible proximity path to arbitrary wearable firmware replacement.
+## Executive conclusions
 
-An unbonded wearable was also observed accepting a fabricated initial identity claim without proof of account ownership. Because link-layer pairing is Just Works, an attacker near a factory-reset, returned, resold, or physically unpaired device can claim it and access privileged OTA functions. For a microphone-equipped product used in PII-rich meetings, this is a critical security and privacy issue.
+1. **Initial ownership is not authenticated.** BLE pairing uses LE Secure Connections Just Works. A factory-reset or otherwise unowned device accepted an invented account identity and immediately granted a privileged session. An already-owned device rejects a different identity, but the first claim is not validated against the Halliday service or any cryptographic proof.
+2. **Brief physical access enables takeover.** The on-device Settings → Unpair action has no owner PIN or equivalent confirmation. After local unpairing, the next nearby party can exploit the unauthenticated first-claim process. A blind remote `CmdUnbond` attempt was correctly rejected, but this does not mitigate the physical path.
+3. **The firmware update trust chain is critically weak.** The production OTA archive is JAR-signed with the publicly available AOSP test key. Its `ota.sh` script writes images directly to the AP, Bluetooth, audio/sensor, and secondary AP partitions without verifying a vendor signature. Static firmware evidence showed CRC32/magic-value integrity checks, not a demonstrated vendor-authenticity check. Whether an immutable bootloader independently rejects a modified image remains to be tested on a lab unit.
+4. **Historical OTA credentials were fixed defaults and reused.** Firmware 0.16.x disclosed the same low-entropy Wi-Fi and FTP credentials on repeated OTA use. Firmware 0.18.1 changes the OTA credentials every time OTA mode is entered. This is a real improvement and eliminates the historical persistent/default-password condition.
+5. **Credential rotation does not fix OTA authorization.** The current per-session credentials are returned over the proprietary BLE channel after the weak first claim. A party that claims an unowned device can request the current credentials, start its OTA access point, and reach its local update services.
+6. **The microphone path warrants high concern.** The glasses carry microphone audio over the same proprietary GATT command/notification channel used by other privileged functions. App analysis recovered the Start Meeting request (`biz=7`, `cmd=2`, encoded command byte `0xE2`) with a fixed, non-secret control payload. The command path is code-confirmed; a complete live adversarial audio-capture demonstration was not performed, so firmware enforcement on that command is the remaining verification point.
 
-## Reconstructed protocol
+## Findings
+
+| ID | Severity | Conclusion |
+|---|---|---|
+| F-01 | Critical | An unowned device accepts an arbitrary first identity claim without account or cryptographic proof. |
+| F-02 | Critical | Production firmware uses the public AOSP test key and the update script performs no vendor-signature check before flashing component images. |
+| F-03 | High | Physical unpair is not owner-protected and exposes the device to the unauthenticated first-claim takeover. |
+| F-04 | High | OTA HTTP/FTP services are reachable using credentials disclosed through the weak BLE trust boundary. |
+| F-05 | High | A code-confirmed microphone-enable command is available over the same channel reached after weak bonding; live firmware enforcement remains to be verified. |
+| F-06 | Medium | Android reports GATT connected when `newState == CONNECTED` without also requiring `status == GATT_SUCCESS`. |
+| F-07 | Medium | An auto-connect disconnect path returns without closing the GATT object, allowing stale clients and reconnect exhaustion. |
+| F-08 | Low | CCCD setup ordering can lose the first notification or indication on a fast peripheral. |
+
+## OTA credentials: historical and current behaviour
+
+| Firmware behaviour | Wi-Fi AP password | FTP account | Persistence |
+|---|---|---|---|
+| Historical, observed on 0.16.x | `besfd123` | `ota` / `abc123` | Fixed defaults reused across OTA-mode entries |
+| Current, confirmed on 0.18.1 | Generated value; one observed example was `m6mKT=yt` | Generated per OTA-mode entry | Changes every time OTA mode is entered |
+
+The historical Wi-Fi password was only eight characters and the FTP password was six characters, with obvious human-readable patterns. Under the unrealistic assumption of uniform selection from 36 lowercase alphanumeric symbols, their maximum search spaces were approximately 41.4 and 31.0 bits. Their actual entropy was much lower because they were fixed product defaults. The FTP transport also provides no confidentiality.
+
+Firmware 0.18.1 materially improves this point by generating fresh values for each OTA-mode entry. The residual problem is authorization rather than password entropy: the active values are supplied to a BLE client after the device accepts its session. On an unowned device, that session can be obtained using an arbitrary fabricated identity.
+
+## Initial connection and ownership protocol
+
+The reconstructed connection flow is:
 
 ```text
-Phone app
-  | BLE advertisements / GATT connection
-  | proprietary command + notification traffic
-  v
-Wearable
-  | enters temporary OTA access-point mode
-  | exposes HTTP service and FTP transfer service on private LAN
-  v
-Wearable OTA services (192.168.4.1 observed)
-  ^
-  | phone sends network and OTA commands; transfer status returns via BLE
-  |
-Vendor gateway: https://halliday-gateway.halliday-tech.com
-  /hallidayiot/app/firmware/upgrade/check
-  /hallidayiot/app/ota/upgrade/start
-  /hallidayiot/app/ota/upgrade/update
-  /hallidayiot/app/device/update/info
+Advertisement match
+  → LE GATT connection
+  → service and characteristic discovery
+  → CCCD subscription
+  → proprietary BF-framed command channel
+  → CmdBond identity claim
+  → privileged BizRunning session
 ```
 
-The application checks for an update at the vendor gateway, starts and records OTA state through the listed APIs, then orchestrates the glasses over BLE. HCI evidence confirmed a real OTA transaction: wearable AP mode, HTTP service availability, FTP credentials supplied in cleartext BLE traffic, a target OTA archive name, and a successful transfer status. The production firmware was subsequently acquired through the authenticated vendor update flow and analysed offline.
+The custom GATT UUIDs recovered from the application and validated against live traffic are:
 
-## Consolidated findings
+- Service: `04000400-0000-1000-8000-009078563412`
+- Notification characteristic: `05000500-0000-1000-8000-009178563412`
+- Write characteristic: `06000600-0000-1000-8000-009278563412`
 
-| ID | Severity | Finding | Security impact |
-|---|---|---|---|
-| F-01 | Critical | OTA firmware trust chain is broken | A retrieved production package uses the public AOSP test certificate; the observed update script did not cryptographically authenticate component images before flashing. |
-| F-02 | Critical | Initial device claim is unauthenticated | A newly unbonded device accepted a fabricated identity claim and then accepted privileged OTA commands. |
-| F-03 | High | OTA AP with HTTP/FTP update surface and low-entropy initial passwords | Nearby attackers can recover the credentials from BLE traffic or cheaply guess them, then access the wearable update network and services. |
-| F-04 | High | Microphone/audio path is exposed after weak bond | Audio uses the same proprietary BLE command/notification channel; a recovered Start Meeting command requires no demonstrated session secret. End-to-end capture remains to be repeated under controlled lab conditions. |
-| F-05 | Medium | GATT connected callback does not require successful status | Initial connection may be reported as ready after a failed or incomplete GATT setup. |
-| F-06 | Medium | Auto-connect path can return without closing the GATT client | Repeated connection attempts may leak client resources and degrade reconnect reliability. |
-| F-07 | Low | CCCD ordering race | The app writes the descriptor before enabling local notifications; a first indication can be lost on fast peripherals. |
+The application protocol uses `BF` magic bytes, protocol/module/command fields, variable-length payload framing, and an additive checksum. The checksum detects accidental damage; it is not a message-authentication code.
 
-### F-03 password strength and disclosure detail
+Pairing is LE Secure Connections Just Works because the glasses advertise `NoInputNoOutput`. This protects a connection from passive interception but does not authenticate the person or account initiating it. Live testing established the ownership rule:
 
-The live OTA trace exposed two initial service passwords: an eight-character Wi-Fi AP password and a six-character FTP password. Both used simple lowercase-letter/digit constructions; the literal values are withheld from this repository. Even if each character had been independently and uniformly selected from all 36 lowercase alphanumeric symbols—which the observed human-readable patterns do not support—the nominal search-space ceilings would be only about 41.4 bits and 31.0 bits respectively. Their effective entropy is materially lower because they follow predictable textual patterns and appear to be product defaults rather than device-generated random secrets.
+- A claimed device rejects a different identity with NCK 24.
+- Privileged commands without a valid session are rejected with NCK 25.
+- A fully reset/unowned device accepts an arbitrary syntactically valid identity and enters the privileged state.
+- Remote unbond without a valid session is rejected.
+- Local unpair from the glasses UI requires no owner secret and recreates the vulnerable unowned state.
 
-The FTP password is below a reasonable modern minimum and is feasible to guess online if rate limiting is absent. The eight-character AP password merely meets the minimum WPA passphrase length and is unsuitable for protecting a security-sensitive update service. More importantly, brute force is unnecessary in the observed workflow: both credentials are transmitted to the phone in readable BLE application payloads after the weak initial bond. Anyone able to complete that bond can obtain the passwords directly. If the same values are reused across devices or update sessions, compromise of one trace becomes a fleet-level or persistent credential exposure.
+## Firmware download and wearable services
 
-These are not independent authentication factors: the party that reaches the weak BLE trust boundary is given the credentials for the next Wi-Fi/FTP boundary. Password rotation alone is therefore insufficient. The local update service needs device-bound, high-entropy, single-use credentials delivered only after authenticated account and device proof, with a short expiry, connection throttling, and no plaintext FTP.
+The app uses the vendor gateway at `https://halliday-gateway.halliday-tech.com`. Recovered OTA routes are:
 
-## Initial-connection analysis
+- `/hallidayiot/app/firmware/upgrade/check`
+- `/hallidayiot/app/ota/upgrade/start`
+- `/hallidayiot/app/ota/upgrade/update`
+- `/hallidayiot/app/device/update/info`
 
-The Android BLE plugin's connection-state handler treats state `CONNECTED` as sufficient for the application-level connected callback, without requiring the GATT status to indicate success. The callback should fail closed unless the status is `GATT_SUCCESS`, and the app should only advertise readiness after service discovery, characteristic validation, notification setup, and an authenticated session handshake complete.
+The authenticated server workflow returns update metadata and the OTA archive. The phone then directs the glasses over BLE to expose a private OTA network. The observed device-side address was `192.168.4.1`; an HTTP service reported ready and FTP was used for archive transfer. BLE status messages reported the target archive and transfer result.
 
-The auto-connect callback also has an early-return branch that does not close the GATT client. Make `disconnect()`/`close()` idempotent and ensure every terminal error and retry path releases the old client.
+The acquired 0.18.1 package contained images for multiple processors and an `ota.sh` script that writes them directly to partition devices. The package's JAR certificate is the public AOSP test certificate. No vendor-signature validation occurs in the script before the writes. CRC/read-back checks establish transfer integrity, not publisher authenticity.
 
-The pre-bond advertisement identifier is only a locator, not proof of identity. Link-layer pairing was observed to use LE Secure Connections Just Works because the wearable has no input/output capability; this prevents passive eavesdropping but does not authenticate a connecting party. Bind the wearable using an authenticated, replay-resistant exchange after GATT encryption is established, and require a physical confirmation plus account-bound proof for first claim and unpairing.
+## Microphone and PII conclusion
 
-## Firmware and microphone-risk evaluation
+The product is designed to process meeting audio and therefore operates in a high-impact PII context. Static analysis confirms microphone/audio management, meeting transcription, cloud WebSocket handling, and a phone-to-glasses meeting-enable command. Firmware analysis also found VAD/wake processing and microphone controls on the Bluetooth/multimedia processor.
 
-The observed OTA workflow creates an especially sensitive trust boundary: it can alter firmware on a microphone-equipped wearable used in PII-rich meetings. The retrieved production OTA package was signed with the public AOSP test key, and review of the update script found no cryptographic verification before writing target partitions. Server-provided hashes and TLS do not substitute for a device-side signature check. The wearable bootloader must verify a versioned vendor signature using a public key embedded in immutable or appropriately protected device storage; it must reject unsigned, modified, replayed, and downgraded images.
+The current evidence establishes a credible route from weak device ownership to audio-control functionality. It does not by itself establish covert exfiltration by the manufacturer or continuous recording. Those questions require a controlled live test correlating BLE audio, the visible recording state, DNS/TLS destinations, cloud WebSocket traffic, local storage, and behaviour with the phone offline.
 
-The vendor gateway and update APIs should require short-lived, audience-bound access tokens; use TLS with certificate validation/pinning where appropriate; do not put device service credentials in BLE payloads; and ensure update URLs are authorized per device and expire promptly. The glasses should disable FTP in production. If local recovery is required, use an authenticated, encrypted, device-bound update protocol with least privilege and an explicit physical-presence control.
+## Required remediation
 
-For microphone and PII assurance, perform a separate firmware and hardware review covering: microphone enablement paths, recording indicator integrity, remote-control permissions, audio buffering/storage, uplink destinations, encryption keys, consent/audit logs, and secure erase. Network egress monitoring and reproducible firmware extraction are required before claiming that meeting audio cannot be accessed or exfiltrated.
+1. Replace the AOSP test key with a protected Halliday production signing key and enforce signature verification plus anti-rollback in immutable boot code for every flashed partition.
+2. Require a Halliday-service challenge and account-bound cryptographic proof for the first device claim, with explicit physical confirmation on the glasses.
+3. Protect local unpair with an owner-authorized action and clearly notify the existing owner of ownership changes.
+4. Retain the 0.18.1 per-session credential generation, but replace FTP with an encrypted, device-bound transfer protocol. Release credentials only after authenticated device and account proof, and expire them when OTA mode exits.
+5. Separate link-connected, services-ready, notifications-ready, and authenticated-session-ready states in the Android client. Require `GATT_SUCCESS`, close every terminal GATT client, and enable local notifications before writing the CCCD.
+6. Require authenticated and authorized control of microphone/meeting commands; provide a hardware-backed recording indicator that firmware cannot suppress.
+7. Complete a lab anti-rollback/signature-rejection test and a controlled end-to-end microphone/privacy test before approving the glasses for meetings containing PII.
 
-## Remediation priority
+## Evidence boundaries
 
-1. Immediately suspend OTA distribution to affected devices; replace the AOSP test key with a protected vendor signing key and enforce signature verification plus anti-rollback in the boot chain.
-2. Remove or lock down the HTTP/FTP OTA service; rotate all deployed OTA credentials and make them per-device, ephemeral, and unavailable over BLE.
-3. Require account-bound, challenge-response first claim with physical confirmation, and protect local unpair with an owner-authorized action.
-4. Repair BLE state handling, GATT cleanup, and notification setup ordering.
-5. Reproduce controlled end-to-end microphone capture testing and audit audio indicators, storage, transmission, consent, and deletion controls.
+The following conclusions are directly confirmed: BLE Just Works pairing, arbitrary first claim on an unowned unit, protection against blind remote unbond, unprotected local unpair, historical fixed OTA defaults, current per-entry credential regeneration, local HTTP/FTP OTA operation, production package acquisition, AOSP test signing, and absence of signature verification in `ota.sh`.
 
-## Validation completed
-
-- Decompiled the Java/Kotlin portion of the APK and inspected the embedded Flutter/native layer.
-- Installed the APK on an authorised USB-connected Android device.
-- Captured and decoded a Bluetooth HCI trace during a successful OTA update from wearable firmware 0.16.x to 0.18.1.
-- Confirmed the vendor gateway paths and the wearable's local OTA AP, HTTP, and FTP behaviour.
-- Retrieved and unpacked the production OTA package; verified the public test signing certificate and reviewed the flashing script.
-- Tested initial claiming on a factory-reset/unbonded unit and observed acceptance of a fabricated identity.
-
-## Limitations
-
-The firmware archive has been analysed, but a complete disassembly of every processor image and a final microphone-exfiltration conclusion are not asserted. The raw evidence is retained separately and should be handled as sensitive security material.
+The remaining high-value tests are whether immutable boot code rejects an altered but structurally valid image, and whether the code-confirmed microphone-enable request is accepted from an independently bonded client and yields live audio without additional authorization.
